@@ -3,6 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0b6b7c" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Tabata S&amp;N" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
   <title>Sport&amp;Nature — Tabata Timer</title>
   <style>
     :root {
@@ -646,6 +653,7 @@
         <button type="button" class="btn btn-ghost" id="btnReset">↺ Reiniciar</button>
         <button type="button" class="btn btn-ghost" id="btnSettings">⚙️ Tiempos</button>
         <button type="button" class="btn btn-ghost" id="btnSound" title="Cambiar entre: Voz + Sonidos / Solo Sonidos / Silencio">🗣️ Voz + Sonido</button>
+        <button type="button" class="btn btn-ghost" id="btnInstall" style="display:none;" title="Instalar como aplicación en la tablet">📲 Instalar</button>
         <button type="button" class="btn btn-ghost" id="btnFullscreen" title="Pantalla completa (Tecla F)">⛶ TV</button>
       </div>
     </header>
@@ -1377,6 +1385,37 @@
       } catch (_) {}
 
       buildWorkout();
+
+      // 4. Registro PWA (Service Worker + Botón de Instalación en Tablet/Móvil)
+      if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('./sw.js').catch(() => {});
+        });
+      }
+
+      const btnInstallEl = document.getElementById('btnInstall');
+      let deferredInstallPrompt = null;
+
+      window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredInstallPrompt = e;
+        if (btnInstallEl) btnInstallEl.style.display = 'inline-flex';
+      });
+
+      if (btnInstallEl) {
+        btnInstallEl.addEventListener('click', async () => {
+          if (!deferredInstallPrompt) return;
+          deferredInstallPrompt.prompt();
+          await deferredInstallPrompt.userChoice;
+          deferredInstallPrompt = null;
+          btnInstallEl.style.display = 'none';
+        });
+      }
+
+      window.addEventListener('appinstalled', () => {
+        deferredInstallPrompt = null;
+        if (btnInstallEl) btnInstallEl.style.display = 'none';
+      });
     })();
   </script>
 </body>
