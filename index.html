@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#0b6b7c" />
   <meta name="description" content="Temporizador Tabata e Intervalos para Sport&amp;Nature" />
-  <meta name="app-version" content="1.1.0-cf" />
+  <meta name="app-version" content="1.2.0-cf" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <meta name="apple-mobile-web-app-title" content="Tabata S&amp;N" />
@@ -785,6 +785,10 @@
         constructor() {
           this.ctx = null;
           this.outNode = null;
+          this.keepAliveOsc = null;
+          this.keepAliveGain = null;
+          this.pendingSpeech = null;
+          this.pendingSpeechTimeout = null;
           // mode: 'voice-sfx' (Voz + Efectos) | 'sfx-only' (Solo Efectos) | 'muted' (Silencio)
           this.mode = 'voice-sfx';
           this.esVoice = null;
@@ -829,30 +833,80 @@
             }
           }
           if (this.ctx && this.ctx.state === 'suspended') {
-            this.ctx.resume();
+            this.ctx.resume().catch(() => {});
           }
         }
 
-        // Pronunciar frase con energía de entrenador de gimnasio
+        // Mantiene vivo el motor de audio en segundo plano (sin pausar Spotify ni consumir MediaSession)
+        startKeepAlive() {
+          this.init();
+          if (!this.ctx || this.keepAliveOsc) return;
+          try {
+            const osc = this.ctx.createOscillator();
+            const gain = this.ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(1, this.ctx.currentTime);
+            gain.gain.setValueAtTime(0.00001, this.ctx.currentTime);
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+            osc.start();
+            this.keepAliveOsc = osc;
+            this.keepAliveGain = gain;
+          } catch (_) {}
+        }
+
+        stopKeepAlive() {
+          if (this.keepAliveOsc) {
+            try { this.keepAliveOsc.stop(); this.keepAliveOsc.disconnect(); } catch (_) {}
+            this.keepAliveOsc = null;
+          }
+          if (this.keepAliveGain) {
+            try { this.keepAliveGain.disconnect(); } catch (_) {}
+            this.keepAliveGain = null;
+          }
+        }
+
+        cancelPendingSpeech() {
+          this.pendingSpeech = null;
+          if (this.pendingSpeechTimeout) {
+            clearTimeout(this.pendingSpeechTimeout);
+            this.pendingSpeechTimeout = null;
+          }
+        }
+
+        _runSpeechNow(text, rate, pitch) {
+          if (this.mode !== 'voice-sfx' || !('speechSynthesis' in window)) return;
+          try {
+            window.speechSynthesis.cancel();
+            const utter = new SpeechSynthesisUtterance(text);
+            if (this.esVoice) utter.voice = this.esVoice;
+            utter.lang = this.esVoice?.lang || 'es-ES';
+            utter.rate = rate;
+            utter.pitch = pitch;
+            utter.volume = 1.0;
+            window.speechSynthesis.speak(utter);
+          } catch (_) {}
+        }
+
+        flushSpeech(now = Date.now()) {
+          if (this.pendingSpeech && now >= this.pendingSpeech.at) {
+            const item = this.pendingSpeech;
+            this.cancelPendingSpeech();
+            this._runSpeechNow(item.text, item.rate, item.pitch);
+          }
+        }
+
+        // Pronunciar frase con energía de entrenador de gimnasio (disparable también desde segundo plano)
         speak(text, delayMs = 0, rate = 1.1, pitch = 1.05) {
           if (this.mode !== 'voice-sfx' || !('speechSynthesis' in window)) return;
-          const runSpeech = () => {
-            if (this.mode !== 'voice-sfx') return;
-            try {
-              window.speechSynthesis.cancel();
-              const utter = new SpeechSynthesisUtterance(text);
-              if (this.esVoice) utter.voice = this.esVoice;
-              utter.lang = this.esVoice?.lang || 'es-ES';
-              utter.rate = rate;
-              utter.pitch = pitch;
-              utter.volume = 1.0;
-              window.speechSynthesis.speak(utter);
-            } catch (_) {}
-          };
+          this.cancelPendingSpeech();
           if (delayMs > 0) {
-            setTimeout(runSpeech, delayMs);
+            this.pendingSpeech = { at: Date.now() + delayMs, text, rate, pitch };
+            this.pendingSpeechTimeout = setTimeout(() => {
+              this.flushSpeech(Date.now());
+            }, delayMs);
           } else {
-            runSpeech();
+            this._runSpeechNow(text, rate, pitch);
           }
         }
 
@@ -1027,18 +1081,97 @@
         done: '¡SESIÓN COMPLETADA!'
       };
 
+      const DEFAULT_TITLE = 'Sport&Nature — Tabata Timer';
+
       let steps = [];
       let totalMs = 0;
       let stepIndex = 0;
       let remMs = 0;
+      let stepEndTime = 0;
       let running = false;
       let rafId = null;
-      let lastTime = 0;
+      let timerWorker = null;
+      let timerWorkerUrl = null;
+      let fallbackIntervalId = null;
+      let wakeLockSentinel = null;
       let pipsFired = new Set();
       let halfwayFired = false;
 
       let tlBlocks = [];
       let tlFills = [];
+
+      async function acquireWakeLock() {
+        if (!('wakeLock' in navigator) || document.hidden || !running) return;
+        try {
+          if (wakeLockSentinel) return;
+          wakeLockSentinel = await navigator.wakeLock.request('screen');
+          wakeLockSentinel.addEventListener('release', () => {
+            wakeLockSentinel = null;
+          });
+        } catch (_) {
+          wakeLockSentinel = null;
+        }
+      }
+
+      function releaseWakeLock() {
+        if (wakeLockSentinel) {
+          wakeLockSentinel.release().catch(() => {});
+          wakeLockSentinel = null;
+        }
+      }
+
+      function startBackgroundClock() {
+        stopBackgroundClock();
+        try {
+          const workerSrc = `
+            let id = null;
+            self.onmessage = (e) => {
+              if (e.data === 'start') {
+                if (id) clearInterval(id);
+                id = setInterval(() => self.postMessage('tick'), 100);
+              } else if (e.data === 'stop') {
+                if (id) clearInterval(id);
+                id = null;
+              }
+            };
+          `;
+          const blob = new Blob([workerSrc], { type: 'application/javascript' });
+          timerWorkerUrl = URL.createObjectURL(blob);
+          timerWorker = new Worker(timerWorkerUrl);
+          timerWorker.onmessage = () => tick();
+          timerWorker.postMessage('start');
+        } catch (_) {
+          timerWorker = null;
+        }
+        // Respaldo adicional por si algún entorno restringe Web Workers
+        fallbackIntervalId = setInterval(() => tick(), 250);
+      }
+
+      function stopBackgroundClock() {
+        if (timerWorker) {
+          try {
+            timerWorker.postMessage('stop');
+            timerWorker.terminate();
+          } catch (_) {}
+          timerWorker = null;
+        }
+        if (timerWorkerUrl) {
+          try { URL.revokeObjectURL(timerWorkerUrl); } catch (_) {}
+          timerWorkerUrl = null;
+        }
+        if (fallbackIntervalId) {
+          clearInterval(fallbackIntervalId);
+          fallbackIntervalId = null;
+        }
+      }
+
+      function stopTimers() {
+        stopBackgroundClock();
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+      }
 
       function getCfg() {
         const num = (el, min, def) => {
@@ -1111,7 +1244,10 @@
             pipsFired.clear();
             halfwayFired = false;
             ui.halfwayBadge.classList.remove('show');
-            if (running) playStepStartSound(steps[stepIndex]);
+            if (running) {
+              stepEndTime = Date.now() + remMs;
+              playStepStartSound(steps[stepIndex]);
+            }
             render();
           });
 
@@ -1143,6 +1279,7 @@
             tlFills[i].style.width = '100%';
           });
           ui.timelineProgressText.textContent = `100% completado (${fmtMMSS(totalMs / 1000)} / ${fmtMMSS(totalMs / 1000)})`;
+          document.title = DEFAULT_TITLE;
           return;
         }
 
@@ -1157,6 +1294,9 @@
 
         const secDisplay = Math.ceil(Math.max(0, remMs) / 1000 - 0.001);
         ui.clockDisplay.textContent = fmtMMSS(secDisplay);
+        document.title = running
+          ? `${fmtMMSS(secDisplay)} · ${PHASE_TITLES[phase]} — Sport&Nature`
+          : DEFAULT_TITLE;
 
         const pctStepLeft = stepDurMs > 0 ? Math.max(0, Math.min(100, (remMs / stepDurMs) * 100)) : 0;
         ui.currentBarFill.style.width = `${pctStepLeft}%`;
@@ -1205,15 +1345,17 @@
 
         if (step.type === 'work' && step.sec >= 6 && !halfwayFired && prevMs > halfMs && newMs <= halfMs) {
           halfwayFired = true;
-          sound.halfway();
-          ui.halfwayBadge.classList.add('show');
-          ui.clockDisplay.classList.remove('flash');
-          void ui.clockDisplay.offsetWidth;
-          ui.clockDisplay.classList.add('flash');
-          setTimeout(() => ui.halfwayBadge.classList.remove('show'), 2200);
+          if (halfMs - newMs < 2000) {
+            sound.halfway();
+            ui.halfwayBadge.classList.add('show');
+            ui.clockDisplay.classList.remove('flash');
+            void ui.clockDisplay.offsetWidth;
+            ui.clockDisplay.classList.add('flash');
+            setTimeout(() => ui.halfwayBadge.classList.remove('show'), 2200);
+          }
         }
 
-        if (step.sec >= 4) {
+        if (step.sec >= 4 && newMs > 0) {
           const sLeft = Math.ceil(newMs / 1000);
           if ((sLeft === 3 || sLeft === 2 || sLeft === 1) && !pipsFired.has(sLeft)) {
             pipsFired.add(sLeft);
@@ -1223,54 +1365,99 @@
         }
       }
 
-      function loop(now) {
+      // Motor de tiempo basado en hora real (Date.now) + Web Worker: sigue contando y pitando en segundo plano
+      function tick() {
         if (!running) return;
-        const dt = Math.min(250, Math.max(0, now - lastTime));
-        lastTime = now;
+        const now = Date.now();
+        sound.flushSpeech(now);
 
         const cur = steps[stepIndex];
+        if (!cur) return;
+
         const prev = remMs;
-        remMs -= dt;
+        remMs = stepEndTime - now;
 
         checkCues(cur, prev, remMs);
 
-        if (remMs <= 0) {
-          const over = Math.abs(remMs);
+        while (remMs <= 0) {
+          const over = -remMs;
           stepIndex++;
           if (stepIndex < steps.length) {
-            remMs = Math.max(0, steps[stepIndex].sec * 1000 - over);
-            playStepStartSound(steps[stepIndex]);
+            const nextStep = steps[stepIndex];
+            stepEndTime += nextStep.sec * 1000;
+            remMs = stepEndTime - now;
+
+            if (remMs > 0) {
+              pipsFired.clear();
+              halfwayFired = false;
+              ui.halfwayBadge.classList.remove('show');
+
+              const elapsedInNext = nextStep.sec * 1000 - remMs;
+              if (elapsedInNext < 2500) {
+                playStepStartSound(nextStep);
+              } else {
+                // Si el SO suspendió la app varios segundos, sincroniza sin disparar avisos atrasados
+                const nextHalfMs = (nextStep.sec * 1000) / 2;
+                if (remMs <= nextHalfMs) halfwayFired = true;
+                for (let s = 3; s >= 1; s--) {
+                  if (remMs <= (s - 1) * 1000) pipsFired.add(s);
+                }
+              }
+            }
           } else {
             remMs = 0;
             running = false;
-            sound.finish();
+            stopTimers();
+            sound.stopKeepAlive();
+            releaseWakeLock();
+            if (over < 10000) sound.finish();
             render();
             return;
           }
         }
 
         render();
-        rafId = requestAnimationFrame(loop);
+      }
+
+      function uiLoop() {
+        if (!running) {
+          rafId = null;
+          return;
+        }
+        tick();
+        if (!document.hidden && running) {
+          rafId = requestAnimationFrame(uiLoop);
+        } else {
+          rafId = null;
+        }
       }
 
       function start() {
         sound.init();
+        sound.startKeepAlive();
         if (stepIndex >= steps.length) buildWorkout();
         const atStart = stepIndex === 0 && remMs === steps[0].sec * 1000;
         running = true;
-        lastTime = performance.now();
+        stepEndTime = Date.now() + remMs;
         ui.btnStartPause.textContent = '⏸ PAUSAR';
         ui.settingsDrawer.classList.remove('open');
         ui.btnSettings.classList.remove('active');
 
         if (atStart) playStepStartSound(steps[0]);
-        if ('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(() => {});
-        rafId = requestAnimationFrame(loop);
+        acquireWakeLock();
+        startBackgroundClock();
+        if (!document.hidden && !rafId) rafId = requestAnimationFrame(uiLoop);
       }
 
       function pause() {
+        if (running) {
+          remMs = Math.max(0, stepEndTime - Date.now());
+        }
         running = false;
-        if (rafId) cancelAnimationFrame(rafId);
+        stopTimers();
+        sound.stopKeepAlive();
+        sound.cancelPendingSpeech();
+        releaseWakeLock();
         ui.btnStartPause.textContent = '▶ CONTINUAR';
         render();
       }
@@ -1279,12 +1466,24 @@
         pause();
         stepIndex = 0;
         remMs = steps.length ? steps[0].sec * 1000 : 0;
+        stepEndTime = 0;
         pipsFired.clear();
         halfwayFired = false;
         ui.halfwayBadge.classList.remove('show');
         ui.btnStartPause.textContent = '▶ EMPEZAR';
         render();
       }
+
+      // Al volver de Spotify u otra pestaña, re-sincronizamos al instante, reactivamos audio y Wake Lock
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && running) {
+          sound.init();
+          sound.startKeepAlive();
+          acquireWakeLock();
+          tick();
+          if (!rafId && running) rafId = requestAnimationFrame(uiLoop);
+        }
+      });
 
       // 3. Eventos
       ui.btnStartPause.addEventListener('click', () => running ? pause() : start());
@@ -1310,6 +1509,7 @@
           sound.mode = 'muted';
           ui.btnSound.classList.add('muted');
           ui.btnSound.textContent = '🔇 Silencio';
+          sound.cancelPendingSpeech();
           if ('speechSynthesis' in window) window.speechSynthesis.cancel();
         } else {
           sound.mode = 'voice-sfx';
