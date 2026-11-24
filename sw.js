@@ -1,4 +1,4 @@
-const CACHE_NAME = 'sportnature-tabata-v3';
+const CACHE_NAME = 'sportnature-tabata-v4';
 const ASSETS = [
   './',
   './index.html',
